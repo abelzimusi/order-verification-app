@@ -10,5 +10,6 @@
         public string Status { get; set; }
         public DateTime CreatedAt { get; set; }
         public decimal Amount { get; set; } // New property to store the extracted amount
+        public bool IsGrocery { get; set; }
     }
 }
