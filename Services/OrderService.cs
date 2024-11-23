@@ -3,6 +3,7 @@ using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using OrderVerificationAPI.Interfaces;
 using OrderVerificationAPI.Models;
+using System.Collections.Concurrent;
 
 namespace OrderVerificationAPI.Services
 {
@@ -13,16 +14,128 @@ namespace OrderVerificationAPI.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly List<string> allowedSenders = new List<string>
         {
-            "27677103182@c.us" // Add more allowed numbers here
+            "27746262742@c.us" // Add more allowed numbers here
         };
+        //public OrderService(AppDbContext context, IOptions<UltraMsgSettings> ultraMsgSettings, IHttpClientFactory httpClientFactory)
+        //{
+        //    _context = context;
+        //    _ultraMsgSettings = ultraMsgSettings.Value;
+        //    _httpClientFactory = httpClientFactory;
+        //}
+        // Concurrent dictionary to track recently processed orders
+        private static readonly ConcurrentDictionary<string, DateTime> _recentlyProcessedOrders = new ConcurrentDictionary<string, DateTime>();
+        private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(2);
+
         public OrderService(AppDbContext context, IOptions<UltraMsgSettings> ultraMsgSettings, IHttpClientFactory httpClientFactory)
         {
             _context = context;
             _ultraMsgSettings = ultraMsgSettings.Value;
             _httpClientFactory = httpClientFactory;
         }
-
         public async Task<string> VerifyAndProcessOrder(string orderNumber, string sender, string jsonBody)
+        {
+            Console.WriteLine($"VerifyAndProcessOrder called with orderNumber: {orderNumber}, sender: {sender}");
+            
+            if (!allowedSenders.Contains(sender)) return ""; // Unauthorized sender
+
+            // Extract the message body
+            var body = ExtractMessageBody(jsonBody);
+            if (string.IsNullOrEmpty(body) || !body.StartsWith("ID-", StringComparison.OrdinalIgnoreCase)) return ""; // Invalid format
+
+            // Check if the message is tagged and avoid reprocessing
+            if (body.Contains("[MWZ~ChatBotService]"))
+            {
+                Console.WriteLine("Skipping message already processed by the service.");
+                return "";
+            }
+            try
+            {
+                // Check if the order number has been recently processed
+                if (_recentlyProcessedOrders.TryGetValue(orderNumber, out var lastProcessedTime) &&
+                    (DateTime.Now - lastProcessedTime) < CacheDuration)
+                {
+                    Console.WriteLine("Order recently processed, skipping.");
+                    return ""; // Already processed
+                }
+
+                // Identify if it’s a grocery order
+                bool isGroceryOrder = IsGroceryOrder(body);
+                var extractedOrderNumber = ExtractOrderNumber(body);
+                var extractedAmount = isGroceryOrder ? ExtractTotalAmount(body) : ExtractAmount(body);
+                var extractedBranchName = ExtractBranch(body);
+                var recipient = ExtractRecipient(body);
+
+                if (string.IsNullOrEmpty(extractedOrderNumber) || extractedAmount == null || string.IsNullOrEmpty(extractedBranchName))
+                {
+                    Console.WriteLine("Failed to extract order number, amount, or branch from the message.");
+                    return ""; // Invalid message content
+                }
+
+                // Retrieve branches from the database and find a match
+                var branches = await _context.Branches.ToListAsync();
+                var matchedBranch = branches.FirstOrDefault(branch => body.Contains(branch.Name, StringComparison.OrdinalIgnoreCase));
+                if (matchedBranch == null) return "Branch not found.";
+
+                var maxOrder = await _context.Orders.OrderByDescending(o => o.OrderNumber).FirstOrDefaultAsync();
+                int newOrderNumber = DetermineNewOrderNumber(maxOrder, extractedOrderNumber);
+
+                // If the extracted order number is outdated, correct it
+                if (int.TryParse(extractedOrderNumber, out int extractedOrderInt) && extractedOrderInt <= int.Parse(maxOrder.OrderNumber))
+                {
+                    newOrderNumber = int.Parse(maxOrder.OrderNumber) + 1;
+                    Console.WriteLine($"Order number outdated, correcting to: {newOrderNumber}");
+                }
+
+                var completeMessage = $"{body} [MWZ~ChatBotService]";
+
+                // Check if the order already exists
+                var existingOrder = await _context.Orders.FirstOrDefaultAsync(o => o.OrderNumber == extractedOrderNumber);
+                if (existingOrder != null)
+                {
+                    if (existingOrder.OrderNumber == newOrderNumber.ToString())
+                    {
+                        Console.WriteLine("Order already corrected, skipping further processing.");
+                        return newOrderNumber.ToString();
+                    }
+
+                    await CreateNewOrder(newOrderNumber.ToString(), matchedBranch.BranchId, recipient, extractedAmount.Value, isGroceryOrder);
+
+                    // Notify and replace with corrected order number
+                    await SendMessage(sender, $"Duplicate order detected. Corrected order number: {newOrderNumber}");
+                    await SendMessage(matchedBranch.PhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
+                    await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
+
+                    // Record the order as processed
+                    _recentlyProcessedOrders[orderNumber] = DateTime.Now;
+
+                    return newOrderNumber.ToString();
+                }
+
+                // Create a new order
+                await CreateNewOrder(extractedOrderNumber, matchedBranch.BranchId, recipient, extractedAmount.Value, isGroceryOrder);
+
+                await SendMessage(matchedBranch.PhoneNumber, completeMessage);
+                await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Processing error: {ex.Message}");
+            }
+            finally
+            {
+                // Dispose context if needed to close the connection
+                Dispose();
+            }
+            Console.WriteLine("Order processed successfully.");
+            _recentlyProcessedOrders[orderNumber] = DateTime.Now;
+            return "Order processed successfully.";
+        }
+        public void Dispose()
+        {
+            _context?.Dispose();
+        }
+
+        public async Task<string> VerifyAndProcessOrder1(string orderNumber, string sender, string jsonBody)
         {
             Console.WriteLine($"VerifyAndProcessOrder called with orderNumber: {orderNumber}, sender: {sender}");
 
@@ -67,7 +180,7 @@ namespace OrderVerificationAPI.Services
             var matchedBranch = branches.FirstOrDefault(branch => body.Contains(branch.Name, StringComparison.OrdinalIgnoreCase));
             if (matchedBranch == null)
             {
-                await SendMessage(sender, "Error: Branch not found in the message.");
+                //await SendMessage(sender, "Error: Branch not found in the message.");
                 return "Branch not found.";
             }
             Console.WriteLine($"Matched Branch: {matchedBranch.Name}");
@@ -159,7 +272,6 @@ namespace OrderVerificationAPI.Services
             await _context.SaveChangesAsync();
         }
 
-      
         private int DetermineNewOrderNumber(Order currentHighestOrder, string extractedOrderNumber)
         {
             // Always correct the order number to be maxOrderNumber + 1
@@ -171,8 +283,86 @@ namespace OrderVerificationAPI.Services
         }
 
         // Method to send a message
-        private async Task SendMessage(string recipient, string text)
+        //public async Task SendMessage(string recipient, string text)
+        //{
+        //    var retryCount = 3;
+        //    for (int attempt = 0; attempt < retryCount; attempt++)
+        //    {
+        //        try
+        //        {
+        //            var client = _httpClientFactory.CreateClient();
+        //            var response = await client.PostAsync(
+        //                $"{_ultraMsgSettings.ApiBaseUrl.TrimEnd('/')}/{_ultraMsgSettings.InstanceId}/messages/chat",
+        //                new FormUrlEncodedContent(new Dictionary<string, string>
+        //                {
+        //                { "token", _ultraMsgSettings.Token },
+        //                { "to", recipient },
+        //                { "body", text }
+        //                }));
+
+        //            if (response.IsSuccessStatusCode)
+        //            {
+        //                Console.WriteLine("Message sent successfully.");
+        //                return;
+        //            }
+        //            else
+        //            {
+        //                Console.WriteLine($"Failed to send message. Status code: {response.StatusCode}");
+        //                Console.WriteLine($"Response content: {await response.Content.ReadAsStringAsync()}");
+        //            }
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            Console.WriteLine($"Attempt {attempt + 1} failed: {ex.Message}");
+        //            if (attempt == retryCount - 1) throw;
+        //            await Task.Delay(2000); // Wait before retrying
+        //        }
+        //    }
+        //}
+        public async Task SendMessage(string recipient, string text)
         {
+            if (string.IsNullOrWhiteSpace(recipient))
+            {
+                Console.WriteLine("Recipient number is empty, skipping message sending.");
+                return;
+            }
+
+            try
+            {
+                var client = _httpClientFactory.CreateClient();
+                var response = await client.PostAsync(
+                    $"{_ultraMsgSettings.ApiBaseUrl.TrimEnd('/')}/{_ultraMsgSettings.InstanceId}/messages/chat",
+                    new FormUrlEncodedContent(new Dictionary<string, string>
+                    {
+                { "token", _ultraMsgSettings.Token },
+                { "to", recipient },
+                { "body", text }
+                    }));
+
+                if (response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine("Message sent successfully.");
+                }
+                else
+                {
+                    Console.WriteLine($"Failed to send message. Status code: {response.StatusCode}");
+                    Console.WriteLine($"Response content: {await response.Content.ReadAsStringAsync()}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while sending message: {ex.Message}");
+            }
+        }
+
+        public async Task SendMessage1(string recipient, string text)
+        {
+            if (string.IsNullOrWhiteSpace(recipient))
+            {
+                Console.WriteLine("Recipient number is empty, skipping message sending.");
+                return;
+            }
+
             var retryCount = 3;
             for (int attempt = 0; attempt < retryCount; attempt++)
             {
@@ -183,9 +373,9 @@ namespace OrderVerificationAPI.Services
                         $"{_ultraMsgSettings.ApiBaseUrl.TrimEnd('/')}/{_ultraMsgSettings.InstanceId}/messages/chat",
                         new FormUrlEncodedContent(new Dictionary<string, string>
                         {
-                        { "token", _ultraMsgSettings.Token },
-                        { "to", recipient },
-                        { "body", text }
+                    { "token", _ultraMsgSettings.Token },
+                    { "to", recipient },
+                    { "body", text }
                         }));
 
                     if (response.IsSuccessStatusCode)
@@ -272,7 +462,7 @@ namespace OrderVerificationAPI.Services
         private decimal? ExtractTotalAmount(string message)
         {
             // Normalize spaces by replacing multiple spaces with a single space
-            message = System.Text.RegularExpressions.Regex.Replace(message, @"\s+", " ");
+            //message = System.Text.RegularExpressions.Regex.Replace(message, @"\s+", " ");
 
             // Check for a line that contains "Total" followed by an amount
             var lines = message.Split('\n'); // Split message into lines to handle multiline messages
@@ -282,7 +472,7 @@ namespace OrderVerificationAPI.Services
                 var trimmedLine = line.Trim();
 
                 // Look for the keyword "Total" in each line (ignore case)
-                if (trimmedLine.StartsWith("Total", StringComparison.OrdinalIgnoreCase))
+                if (trimmedLine.StartsWith("Total", StringComparison.OrdinalIgnoreCase) || trimmedLine.Contains("roceries for", StringComparison.OrdinalIgnoreCase))
                 {
                     // Split the line into words and search for the amount prefixed with "R"
                     var parts = trimmedLine.Split(' ');
@@ -300,33 +490,6 @@ namespace OrderVerificationAPI.Services
             // If no valid amount found, return null
             return null;
         }
-
-        private decimal? ExtractTotalAmount1(string message)
-        {
-            // Check for a line that contains "Total" followed by an amount
-            var lines = message.Split('\n'); // Split message into lines to handle multiline messages
-            foreach (var line in lines)
-            {
-                // Look for the keyword "Total" in each line
-                if (line.StartsWith("Total", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Split the line into words and search for the amount prefixed with "R"
-                    var parts = line.Split(' ');
-                    foreach (var part in parts)
-                    {
-                        // Check if part starts with "R" and is a valid decimal number
-                        if (part.StartsWith("R", StringComparison.OrdinalIgnoreCase) && decimal.TryParse(part.Substring(1), out var totalAmount))
-                        {
-                            return totalAmount; // Return the extracted total amount
-                        }
-                    }
-                }
-            }
-
-            // If no valid amount found, return null
-            return null;
-        }
-
 
         private bool IsGroceryOrder(string message)
         {
@@ -359,5 +522,225 @@ namespace OrderVerificationAPI.Services
             }
             return "Unknown Recipient";
         }
+        #region Handle auto responses
+        // New method to handle keyword-based responses
+        public async Task<string> HandleKeywordBasedResponses(string sender, string message)
+        {
+            //await FetchAndStoreGroupIds();
+            // Normalize the message for comparison by converting to lowercase
+            message = message.ToLower();
+
+            // List of keyword-based triggers and their corresponding responses
+            var keywordResponses = new List<(List<string> keywords, string response)>
+            {
+                (new List<string> { "ndoda account", "ndokumbirawo account", "ndipeiwo account", "account number yakarasika","FNB","YeCapitec","account yenyu",
+                    "ndipei account", "can i have account","ndaikumbirawo account", "account yenyu irkushanda here" },
+                    "*MWZ Diaspora Services Banking Details*\n\n" +
+                    "Mari(Cash) 10%\nGroceries and Hardware 5%\n\n" +
+                    "*Mari dziripasi peR1000(Less than R1000)*\n" +
+                    "FNB (Less than 1000)\nAccount number 62844699770\nA Zimusi\n\n" +
+                    "*Mari dziripamusoro peR1000(More than R1000)*\n" +
+                    "FNB 62927338807\nMWZ Diaspora Services\n\n" +
+                    "*Chero Mari(Any Amount)*\nCapitec\nA Zimusi\n2275313199\n\n" +
+                    "(Transfers from Nedbank only/ Vanotumira kubva kunedbank neaccount chete)\n" +
+                    "Nedbank\nA. Zimusi\n1284377113\n\n" +
+                    "*MWZ Diaspora Services : 0746262742*\n\n" +
+                    "T & C *Mari munoisa paATM or kuita transfer mukaisa mukati mebank munobhadhara macharges*"),
+
+                (new List<string> { "mamuka sei" }, "Tamuka mamukawo sei"),
+                (new List<string> { "mamka sei" }, "Tamuka mamukawo sei"),
+                (new List<string> { "dakutumira mari" }, "Tumirai henyu"),
+                (new List<string> { "ndichatumira mari" }, "Tumirai henyu"),
+                (new List<string> { "ndoda kutumira mari" }, "Tumirai henyu"),
+                (new List<string> { "kurisei sei" }, "kwakanaka uku murisei"),
+                (new List<string> { "murisei" }, "Tiripo makadiniwo"),
+                (new List<string> { "kurisei" }, "Kuribhoo murisei"),
+                (new List<string> { "makadini" }, "Tiripo makadiniwo"),
+                (new List<string> { "kwaziwai" }, "Tiripo makadiniwo"),
+               // (new List<string> { "hi" }, "Hi"),
+                (new List<string> { "sekuru murisei" }, "Kuribhoo uku mzaya, kurisei"),
+                (new List<string> { "kule murisei" }, "Kuribhoo uku mzaya, kurisei"),
+                (new List<string> { "mzaya murisei" }, "Kuribhoo uku kule, murisei"),
+                (new List<string> { "gules murisei" }, "Kuribhoo uku murisei bamnini"),
+                (new List<string> { "kukanda mari" }, "Kandai henyu"),
+
+                (new List<string> { "mamuka here" }, "Tamuka mamukawo sei"),
+                (new List<string> { "hello" }, "Hello"),
+                (new List<string> { "maita basa" }, "Zvakanakai tinotenda nekushandidzana kwakanaka"),
+                (new List<string> { "thanks" }, "Zvakanakai tinotenda"),
+                (new List<string> { "dankie" }, "Zvakanakai tinotenda"),
+                (new List<string> { "danki" }, "Zvakanakai tinotenda"),
+
+                (new List<string> { "thank you" }, "Zvakanakai tinotenda"),
+                (new List<string> { "maswera sei", "maswera here", "maswera" }, "Taswera maswerawo"),
+                (new List<string> { "ndoda kutumira mari", "ndokumbirawo kutumira mari", "ndoda kusenda mari",
+                    "ndokumbira kusenda mari", "ndirikutumira mari", "ndodawo kutumira mari", "ndingatumirawo mari",
+                    "ndingasendawo mari" }, "Tumirai henyu")
+            };
+           
+            // Loop through the keyword-responses list and find a match
+            foreach (var (keywords, response) in keywordResponses)
+            {
+                // If any of the keywords are contained in the message
+                if (keywords.Any(keyword => message.Contains(keyword)))
+                {
+                    // Send the appropriate response to the sender with a unique tag
+                    await SendMessage(sender, $"{response}\n\n");// [MWZ~ChatBotResponse]");
+                    return response; // Return the response that was sent
+                }
+            }
+            return null; // No keyword matched
+        }
+        public async Task<string> HandleKeywordBasedResponses1(string sender, string message)
+        {
+            // Normalize the message for comparison by converting to lowercase
+            message = message.ToLower();
+
+            // List of keyword-based triggers and their corresponding responses
+            var keywordResponses = new List<(List<string> keywords, string response)>
+            {
+                (new List<string> { "ndoda account", "ndokumbirawo account", "ndipeiwo account", "account number yakarasika","FNB","YeCapitec","account yenyu",
+                    "ndipei account", "can i have account","ndaikumbirawo account", "account yenyu irkushanda here" },
+                    "*MWZ Diaspora Services Banking Details*\n\n" +
+                    "Mari(Cash) 10%\nGroceries and Hardware 5%\n\n" +
+                    "*Mari dziripasi peR1000(Less than R1000)*\n" +
+                    "FNB (Less than 1000)\nAccount number 62844699770\nA Zimusi\n\n" +
+                    "*Mari dziripamusoro peR1000(More than R1000)*\n" +
+                    "FNB 62927338807\nMWZ Diaspora Services\n\n" +
+                    "*Chero Mari(Any Amount)*\nCapitec\nA Zimusi\n2275313199\n\n" +
+                    "(Transfers from Nedbank only/ Vanotumira kubva kunedbank neaccount chete)\n" +
+                    "Nedbank\nA. Zimusi\n1284377113\n\n" +
+                    "*MWZ Diaspora Services : 0746262742*\n\n" +
+                    "T & C *Mari munoisa paATM or kuita transfer mukaisa mukati mebank munobhadhara macharges*"),
+
+                (new List<string> { "mamuka sei" }, "Tamuka mamukawo sei"),
+                (new List<string> { "mamka sei" }, "Tamuka mamukawo sei"),
+                (new List<string> { "dakutumira mari" }, "Tumirai henyu"),
+                (new List<string> { "ndichatumira mari" }, "Tumirai henyu"),
+                (new List<string> { "ndoda kutumira mari" }, "Tumirai henyu"),
+                (new List<string> { "kurisei sei" }, "kwakanaka uku murisei"),
+                (new List<string> { "murisei" }, "Tiripo makadiniwo"),
+                (new List<string> { "kurisei" }, "Kuribhoo murisei"),
+                (new List<string> { "makadini" }, "Tiripo makadiniwo"),
+                (new List<string> { "kwaziwai" }, "Tiripo makadiniwo"),
+                (new List<string> { "hi" }, "Hi"),
+                (new List<string> { "sekuru murisei" }, "Kuribhoo uku mzaya, kurisei"),
+                (new List<string> { "kule murisei" }, "Kuribhoo uku mzaya, kurisei"),
+                (new List<string> { "mzaya murisei" }, "Kuribhoo uku kule, murisei"),
+                (new List<string> { "gules murisei" }, "Kuribhoo uku murisei bamnini"),
+                (new List<string> { "kukanda mari" }, "Kandai henyu"),
+
+                (new List<string> { "mamuka here" }, "Tamuka mamukawo sei"),
+                (new List<string> { "hello" }, "Hello"),
+                (new List<string> { "maita basa" }, "Zvakanakai tinotenda nekushandidzana kwakanaka"),
+                (new List<string> { "thanks" }, "Zvakanakai tinotenda"),
+                (new List<string> { "dankie" }, "Zvakanakai tinotenda"),
+                (new List<string> { "danki" }, "Zvakanakai tinotenda"),
+
+                (new List<string> { "thank you" }, "Zvakanakai tinotenda"),
+                (new List<string> { "maswera sei", "maswera here", "maswera" }, "Taswera maswerawo"),
+                (new List<string> { "ndoda kutumira mari", "ndokumbirawo kutumira mari", "ndoda kusenda mari",
+                    "ndokumbira kusenda mari", "ndirikutumira mari", "ndodawo kutumira mari", "ndingatumirawo mari",
+                    "ndingasendawo mari" }, "Tumirai henyu")
+            };
+
+            // Loop through the keyword-responses list and find a match
+            //foreach (var (keywords, response) in keywordResponses)
+            //{
+            //    // If any of the keywords are contained in the message
+            //    if (keywords.Any(keyword => message.Contains(keyword)))
+            //    {
+            //        // Send the appropriate response to the sender
+            //        await SendMessage(sender, response);
+            //        return response; // Return the response that was sent
+            //    }
+            //}
+            // Loop through the keyword-responses list and find a match
+            foreach (var (keywords, response) in keywordResponses)
+            {
+                // If any of the keywords are contained in the message
+                if (keywords.Any(keyword => message.Contains(keyword)))
+                {
+                    // Send the appropriate response to the sender
+                    await SendMessage(sender, response); // Ensure 'sender' is the correct WhatsApp ID here
+                    return response; // Return the response that was sent
+                }
+            }
+            return null; // No keyword matched
+        }
+
+        // Call this method in the Webhook or any message handler that receives messages
+        public async Task<string> ProcessAndRespondToMessage(string sender, string message)
+        {
+            // Check for keyword-based responses
+            var response = await HandleKeywordBasedResponses(sender, message);
+            if (response != null)
+            {
+                // If a response was sent based on a keyword, return success
+                return "Keyword-based response sent.";
+            }
+
+            // If no keyword-based response, continue with other processing (like orders) if necessary
+            // (Existing order processing logic goes here...)
+
+            return "No keyword-based response required.";
+        }
+        #endregion
+        public async Task<List<ChatInfo>> FetchAndStoreGroupIds()
+        {
+            var client = _httpClientFactory.CreateClient();
+            var groupIds = new List<ChatInfo>();
+
+            try
+            {
+                // Call UltraMsg API to get all active chats
+                var response = await client.GetAsync(
+                    $"{_ultraMsgSettings.ApiBaseUrl.TrimEnd('/')}/{_ultraMsgSettings.InstanceId}/getChats?token={_ultraMsgSettings.Token}");
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var responseContent = await response.Content.ReadAsStringAsync();
+
+                    // Attempt to deserialize as List<ChatInfo>
+                    try
+                    {
+                        var chatList = JsonConvert.DeserializeObject<List<ChatInfo>>(responseContent);
+
+                        // Filter out groups
+                        groupIds = chatList.Where(chat => chat.Id.EndsWith("@g.us")).ToList();
+
+                        // Log and output the group IDs (just for verification)
+                        Console.WriteLine("Fetched Group IDs:");
+                        foreach (var group in groupIds)
+                        {
+                            Console.WriteLine($"Group Name: {group.Name}, Group ID: {group.Id}");
+                        }
+
+                        // Store or save the group IDs as needed, e.g., in a database or a configuration file.
+                        // For demonstration, this could be saved into a local file.
+                        var groupData = JsonConvert.SerializeObject(groupIds);
+                        await File.WriteAllTextAsync("GroupIds.json", groupData);
+                    }
+                    catch (JsonSerializationException)
+                    {
+                        // Handle error response
+                        //var errorResponse = JsonConvert.DeserializeObject<ErrorResponse>(responseContent);
+                        //Console.WriteLine($"Error fetching group IDs: {errorResponse?.Error}");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Failed to fetch chats. Status code: {response.StatusCode}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error fetching group IDs: {ex.Message}");
+            }
+
+            return groupIds;
+        }
+
+
     }
 }
