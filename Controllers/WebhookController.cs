@@ -49,18 +49,19 @@ namespace OrderVerificationAPI.Controllers
                     string messageId = webhook.Data.Id;
                     string messageType = webhook.Data.Type;
                     string mediaUrl = webhook.Data.Media;
+                    string To= webhook.Data.To;
                     Console.WriteLine($"Parsed message: Text={text}, Sender={sender}, MessageId={messageId}");
 
                     if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(sender) || string.IsNullOrEmpty(messageId))
                     {
                         if (messageType == "image" && !string.IsNullOrEmpty(mediaUrl))
                         {
-                            var imagePath = await DownloadImage(mediaUrl); // Method to download the image
-                            var extractedText = ExtractTextFromImage(imagePath); // Method to extract text from the image
-                            Console.WriteLine($"Extracted Text: {extractedText}");
+                           // var imagePath = await DownloadImage(mediaUrl); // Method to download the image
+                           // var extractedText = ExtractTextFromImage(imagePath); // Method to extract text from the image
+                            //Console.WriteLine($"Extracted Text: {extractedText}");
 
                             // Clear the image after processing
-                            ClearImage(imagePath);
+                           // ClearImage(imagePath);
                             return Ok("Image processed and cleared.");
                         }
                         Console.WriteLine("Message content or ID is missing or invalid");
@@ -107,11 +108,19 @@ namespace OrderVerificationAPI.Controllers
                     // Check if the message is an order-related message with "ID-"
                     if (text.StartsWith("ID-", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (sender == ServiceSenderId)
+                        if (To.ToString().Contains("777202850") && To.ToString().Contains("713978760") && To.ToString().Contains("772727946")
+                            && To.ToString().Contains("779052292"))
                         {
-                            var result = await _orderService.VerifyAndProcessOrder(text, sender, body);
-                            return Ok();//result);
+                            Console.WriteLine("Ignored outgoing message");
+                            return Ok();
                         }
+                        
+                            if (sender == ServiceSenderId)
+                            {
+                                var result = await _orderService.VerifyAndProcessOrder(text, sender, body);
+                                return Ok();//result);
+                            }
+                        
                     }
 
                     // If no criteria matched, return a default response

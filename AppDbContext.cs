@@ -20,7 +20,9 @@ namespace OrderVerificationAPI
             modelBuilder.Entity<Order>()
                 .Property(o => o.Amount)
                 .HasColumnType("decimal(18,2)"); // Specify precision and scale
-
+            modelBuilder.Entity<Branch>()
+           .Property(b => b.Group)
+           .HasConversion<int>(); // Store enum as integer
             base.OnModelCreating(modelBuilder);
         }
 
