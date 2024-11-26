@@ -13,6 +13,7 @@ namespace OrderVerificationAPI.Services
         private readonly AppDbContext _context;
         private readonly UltraMsgSettings _ultraMsgSettings;
         private readonly IHttpClientFactory _httpClientFactory;
+        private static readonly object _processOrderLock = new object();
         private readonly List<string> allowedSenders = new List<string>
         {
             "27746262742@c.us" // Add more allowed numbers here
@@ -35,7 +36,8 @@ namespace OrderVerificationAPI.Services
         }
         public async Task<string> VerifyAndProcessOrder(string orderNumber, string sender, string jsonBody)
         {
-            Console.WriteLine($"VerifyAndProcessOrder called with orderNumber: {orderNumber}, sender: {sender}");
+         
+           Console.WriteLine($"VerifyAndProcessOrder called with orderNumber: {orderNumber}, sender: {sender}");
 
             if (!allowedSenders.Contains(sender)) return ""; // Unauthorized sender
 
@@ -47,7 +49,19 @@ namespace OrderVerificationAPI.Services
                 Console.WriteLine("Skipping message already processed by the service.");
                 return "";
             }
+            lock (_processOrderLock)
+            {
+                // Check if this order has already been processed recently
+                if (_recentlyProcessedOrders.TryGetValue(orderNumber, out var lastProcessedTime) &&
+                    (DateTime.Now - lastProcessedTime) < CacheDuration)
+                {
+                    Console.WriteLine("Order recently processed, skipping.");
+                    return ""; // Skip since the order was processed already
+                }
 
+                // Mark the order as being processed
+                _recentlyProcessedOrders[orderNumber] = DateTime.Now;
+            }
             try
             {
                 if (_recentlyProcessedOrders.TryGetValue(orderNumber, out var lastProcessedTime) &&
@@ -63,14 +77,18 @@ namespace OrderVerificationAPI.Services
                 var extractedBranchName = ExtractBranch(body,branches);//(body);
                 var recipient = ExtractRecipient(body);
 
-                if (string.IsNullOrEmpty(extractedOrderNumber) || extractedAmount == null || string.IsNullOrEmpty(extractedBranchName))
+                if (string.IsNullOrEmpty(extractedOrderNumber) || extractedAmount == null || string.IsNullOrEmpty(extractedBranchName.Name))
                 {
                     Console.WriteLine("Failed to extract order number, amount, or branch from the message.");
                     return ""; // Invalid message content
                 }
 
-                
-                var matchedBranch = branches.FirstOrDefault(branch => body.Contains(branch.Name, StringComparison.OrdinalIgnoreCase));
+
+                // var matchedBranch = branches.FirstOrDefault(branch => body.Contains(branch.Name, StringComparison.OrdinalIgnoreCase));
+                var matchedBranch = branches
+                                   .OrderByDescending(branch => branch.Name.Length) // Sort by length of branch name to prioritize longer names
+                                   .FirstOrDefault(branch => body.Contains(branch.Name, StringComparison.OrdinalIgnoreCase));
+
                 if (matchedBranch == null) return "Branch not found.";
 
                 var maxOrder = await _context.Orders
@@ -103,8 +121,8 @@ namespace OrderVerificationAPI.Services
                     await CreateNewOrder(newOrderNumber.ToString(), matchedBranch.BranchId, recipient, extractedAmount.Value, isGroceryOrder);
 
                     await SendMessage(sender, $"Duplicate order detected. Corrected order number: {newOrderNumber}");
-                    await SendMessage(matchedBranch.PhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
-                    await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
+                    //await SendMessage(matchedBranch.PhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
+                    //await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
 
                     _recentlyProcessedOrders[orderNumber] = DateTime.Now;
 
@@ -113,8 +131,8 @@ namespace OrderVerificationAPI.Services
 
                 await CreateNewOrder(extractedOrderNumber, matchedBranch.BranchId, recipient, extractedAmount.Value, isGroceryOrder);
 
-                await SendMessage(matchedBranch.PhoneNumber, completeMessage);
-                await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage);
+                //await SendMessage(matchedBranch.PhoneNumber, completeMessage);
+                //await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage);
             }
             catch (Exception ex)
             {
@@ -127,127 +145,13 @@ namespace OrderVerificationAPI.Services
             Console.WriteLine("Order processed successfully.");
             _recentlyProcessedOrders[orderNumber] = DateTime.Now;
             return "Order processed successfully.";
+
         }
 
-        //public async Task<string> VerifyAndProcessOrderbak(string orderNumber, string sender, string jsonBody)
-        //{
-        //    Console.WriteLine($"VerifyAndProcessOrder called with orderNumber: {orderNumber}, sender: {sender}");
-            
-        //    if (!allowedSenders.Contains(sender)) return ""; // Unauthorized sender
-
-        //    // Extract the message body
-        //    var body = ExtractMessageBody(jsonBody);
-        //    if (string.IsNullOrEmpty(body) || !body.StartsWith("ID-", StringComparison.OrdinalIgnoreCase)) return ""; // Invalid format
-
-        //    // Check if the message is tagged and avoid reprocessing
-        //    if (body.Contains("[MWZ~ChatBotService]"))
-        //    {
-        //        Console.WriteLine("Skipping message already processed by the service.");
-        //        return "";
-        //    }
-        //    try
-        //    {
-        //        // Check if the order number has been recently processed
-        //        if (_recentlyProcessedOrders.TryGetValue(orderNumber, out var lastProcessedTime) &&
-        //            (DateTime.Now - lastProcessedTime) < CacheDuration)
-        //        {
-        //            Console.WriteLine("Order recently processed, skipping.");
-        //            return ""; // Already processed
-        //        }
-
-        //        // Identify if it’s a grocery order
-        //        bool isGroceryOrder = IsGroceryOrder(body);
-        //        var extractedOrderNumber = ExtractOrderNumber(body);
-        //        var extractedAmount = isGroceryOrder ? ExtractTotalAmount(body) : ExtractAmount(body);
-        //        var extractedBranchName = ExtractBranch(body);
-        //        var recipient = ExtractRecipient(body);
-
-        //        if (string.IsNullOrEmpty(extractedOrderNumber) || extractedAmount == null || string.IsNullOrEmpty(extractedBranchName))
-        //        {
-        //            Console.WriteLine("Failed to extract order number, amount, or branch from the message.");
-        //            return ""; // Invalid message content
-        //        }
-
-        //        // Retrieve branches from the database and find a match
-        //        var branches = await _context.Branches.ToListAsync();
-        //        var matchedBranch = branches.FirstOrDefault(branch => body.Contains(branch.Name, StringComparison.OrdinalIgnoreCase));
-        //        if (matchedBranch == null) return "Branch not found.";
-
-        //        var maxOrder = await _context.Orders.OrderByDescending(o => o.OrderNumber).FirstOrDefaultAsync();
-        //        int newOrderNumber = DetermineNewOrderNumber(maxOrder, extractedOrderNumber);
-
-        //        // If the extracted order number is outdated, correct it
-        //        if (int.TryParse(extractedOrderNumber, out int extractedOrderInt) && extractedOrderInt <= int.Parse(maxOrder.OrderNumber))
-        //        {
-        //            newOrderNumber = int.Parse(maxOrder.OrderNumber) + 1;
-        //            Console.WriteLine($"Order number outdated, correcting to: {newOrderNumber}");
-        //        }
-
-        //        var completeMessage = $"{body} [MWZ~ChatBotService]";
-
-        //        // Check if the order already exists
-        //        var existingOrder = await _context.Orders.FirstOrDefaultAsync(o => o.OrderNumber == extractedOrderNumber);
-        //        if (existingOrder != null)
-        //        {
-        //            if (existingOrder.OrderNumber == newOrderNumber.ToString())
-        //            {
-        //                Console.WriteLine("Order already corrected, skipping further processing.");
-        //                return newOrderNumber.ToString();
-        //            }
-
-        //            await CreateNewOrder(newOrderNumber.ToString(), matchedBranch.BranchId, recipient, extractedAmount.Value, isGroceryOrder);
-
-        //            // Notify and replace with corrected order number
-        //            await SendMessage(sender, $"Duplicate order detected. Corrected order number: {newOrderNumber}");
-        //            await SendMessage(matchedBranch.PhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
-        //            await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage.Replace(extractedOrderNumber, newOrderNumber.ToString()));
-
-        //            // Record the order as processed
-        //            _recentlyProcessedOrders[orderNumber] = DateTime.Now;
-
-        //            return newOrderNumber.ToString();
-        //        }
-
-        //        // Create a new order
-        //        await CreateNewOrder(extractedOrderNumber, matchedBranch.BranchId, recipient, extractedAmount.Value, isGroceryOrder);
-
-        //        await SendMessage(matchedBranch.PhoneNumber, completeMessage);
-        //        await SendMessage(matchedBranch.AdminPhoneNumber, completeMessage);
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        Console.WriteLine($"Processing error: {ex.Message}");
-        //    }
-        //    finally
-        //    {
-        //        // Dispose context if needed to close the connection
-        //        Dispose();
-        //    }
-        //    Console.WriteLine("Order processed successfully.");
-        //    _recentlyProcessedOrders[orderNumber] = DateTime.Now;
-        //    return "Order processed successfully.";
-        //}
         public void Dispose()
         {
             _context?.Dispose();
         }
-//        private List<Branch> branch()
-//        {
-//            return  new List<Branch>
-//{
-//    new Branch { Name = "Neshuro", Group = BranchGroup.NJShops, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Rutenga", Group = BranchGroup.NJShops, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Maranda", Group = BranchGroup.NJShops, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Mataga", Group = BranchGroup.NJShops, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Sarahuru", Group = BranchGroup.NJShops, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Muntee Investments", Group = BranchGroup.TnPAndMunteeInvestments, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    // Assuming TnP is also a branch in your system
-//    new Branch { Name = "TnP", Group = BranchGroup.TnPAndMunteeInvestments, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Chomutobwe", Group = BranchGroup.Chomutobwe, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//    new Branch { Name = "Ngundu", Group = BranchGroup.Ngundu, PhoneNumber = "0760144690", AdminPhoneNumber = "0760144690" },
-//};}
-       
-
         private async Task CreateNewOrder(string orderNumber, int branchId, string recipient, decimal amount)
         {
             var newOrder = new Order
@@ -291,43 +195,6 @@ namespace OrderVerificationAPI.Services
             return int.TryParse(extractedOrderNumber, out int parsedOrderNumber) ? parsedOrderNumber : 1;
         }
 
-        // Method to send a message
-        //public async Task SendMessage(string recipient, string text)
-        //{
-        //    var retryCount = 3;
-        //    for (int attempt = 0; attempt < retryCount; attempt++)
-        //    {
-        //        try
-        //        {
-        //            var client = _httpClientFactory.CreateClient();
-        //            var response = await client.PostAsync(
-        //                $"{_ultraMsgSettings.ApiBaseUrl.TrimEnd('/')}/{_ultraMsgSettings.InstanceId}/messages/chat",
-        //                new FormUrlEncodedContent(new Dictionary<string, string>
-        //                {
-        //                { "token", _ultraMsgSettings.Token },
-        //                { "to", recipient },
-        //                { "body", text }
-        //                }));
-
-        //            if (response.IsSuccessStatusCode)
-        //            {
-        //                Console.WriteLine("Message sent successfully.");
-        //                return;
-        //            }
-        //            else
-        //            {
-        //                Console.WriteLine($"Failed to send message. Status code: {response.StatusCode}");
-        //                Console.WriteLine($"Response content: {await response.Content.ReadAsStringAsync()}");
-        //            }
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            Console.WriteLine($"Attempt {attempt + 1} failed: {ex.Message}");
-        //            if (attempt == retryCount - 1) throw;
-        //            await Task.Delay(2000); // Wait before retrying
-        //        }
-        //    }
-        //}
         public async Task SendMessage(string recipient, string text)
         {
             if (string.IsNullOrWhiteSpace(recipient))
@@ -516,60 +383,28 @@ namespace OrderVerificationAPI.Services
             return false;
         }
 
-        //private string ExtractBranch(string message)
-        //{
-        //    var lines = message.Split('\n');
-        //    if (lines.Length > 2)
-        //    {
-        //        return lines[2].Trim();
-        //    }
-        //    return null;
-        //}
-        private string ExtractBranch(string message, List<Branch> branches)
+        private Branch ExtractBranch(string message, List<Branch> branches)
         {
-            // Split the message into lines
-            var lines = message.Split('\n');
+            Branch bestMatch = null;
+            branches=branches.OrderByDescending(branch => branch.BranchId).ToList();
+            // Normalize message by removing excess spaces and combining lines with a separator
+            string normalizedMessage = string.Join(" ", message.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries));
 
-            // Iterate over each line in the message
-            foreach (var line in lines)
+            foreach (var branch in branches)
             {
-                // Iterate over each branch
-                foreach (var branch in branches)
+                var pattern = $@"\b{Regex.Escape(branch.Name)}\b";
+                if (Regex.IsMatch(normalizedMessage, pattern, RegexOptions.IgnoreCase))
                 {
-                    // Check if the branch name is contained in the line (case-insensitive)
-                    if (line.IndexOf(branch.Name, StringComparison.OrdinalIgnoreCase) >= 0)
+                    // If there's no best match yet or the current branch name is longer, update bestMatch
+                    if (bestMatch == null || branch.Name.Length > bestMatch.Name.Length)
                     {
-                        // Return the branch name when a match is found
-                        return branch.Name;
+                        bestMatch = branch;
                     }
                 }
             }
 
-            // If no match is found in individual lines, check the entire message
-            foreach (var branch in branches)
-            {
-                if (message.IndexOf(branch.Name, StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    return branch.Name;
-                }
-            }
-
-            // Return null if no branch name is found
-            return null;
+            return bestMatch;
         }
-
-        //private string ExtractBranch(string message, List<Branch> branches)
-        //{
-        //    foreach (var branch in branches)
-        //    {
-        //        var pattern = $@"\b{Regex.Escape(branch.Name)}\b";
-        //        if (Regex.IsMatch(message, pattern, RegexOptions.IgnoreCase))
-        //        {
-        //            return branch.Name;
-        //        }
-        //    }
-        //    return null;
-        //}
 
         private string ExtractRecipient(string message)
         {
@@ -726,7 +561,24 @@ namespace OrderVerificationAPI.Services
             }
             return null; // No keyword matched
         }
+        public bool IsMessageRecent(DateTime messageTime, int thresholdMinutes = 10)
+        {
+            DateTime currentTime = DateTime.Now; // This gets the current local time
+            TimeSpan timeDifference = currentTime - messageTime;
 
+            return timeDifference.TotalMinutes <= thresholdMinutes;
+        }
+        public DateTime ConvertUnixTimestampToDateTime(long unixTimestamp)
+        {
+            // Convert Unix timestamp to UTC DateTime
+            DateTime dateTimeUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
+
+            // Adjust to South Africa Standard Time (UTC+2)
+            TimeZoneInfo southAfricaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("South Africa Standard Time");
+            DateTime southAfricaDateTime = TimeZoneInfo.ConvertTimeFromUtc(dateTimeUtc, southAfricaTimeZone);
+
+            return southAfricaDateTime;
+        }
         // Call this method in the Webhook or any message handler that receives messages
         public async Task<string> ProcessAndRespondToMessage(string sender, string message)
         {

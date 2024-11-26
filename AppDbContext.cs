@@ -9,6 +9,7 @@ namespace OrderVerificationAPI
 
         public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
         public DbSet<Branch> Branches { get; set; }
+        public DbSet<TransactionCode> TransactionCodes { get; set; }
 
         //protected override void OnModelCreating(ModelBuilder modelBuilder)
         //{

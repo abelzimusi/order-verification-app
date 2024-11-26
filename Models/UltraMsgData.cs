@@ -23,6 +23,7 @@ namespace OrderVerificationAPI.Models
             public string Ack { get; set; }
             public string Type { get; set; }
             public string Media { get; set; }
+            public long Time { get; set; }
         }
     }
 
